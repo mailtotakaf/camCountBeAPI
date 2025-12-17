@@ -1,0 +1,380 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Store people count backend (API Gateway + Lambda + DynamoDB)
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: store-people
+  StaleSeconds:
+    Type: Number
+    Default: 120
+
+Resources:
+  StoreStatusTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${ProjectName}-store_status"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: store_id
+          AttributeType: N
+      KeySchema:
+        - AttributeName: store_id
+          KeyType: HASH
+
+  StoreEventsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${ProjectName}-store_events"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: store_id
+          AttributeType: N
+        - AttributeName: ts
+          AttributeType: N
+      KeySchema:
+        - AttributeName: store_id
+          KeyType: HASH
+        - AttributeName: ts
+          KeyType: RANGE
+
+  ApiRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-lambda-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:GetItem
+                  - dynamodb:Scan
+                  - dynamodb:Query
+                Resource:
+                  - !GetAtt StoreStatusTable.Arn
+                  - !GetAtt StoreEventsTable.Arn
+
+  IngestFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-ingest"
+      Runtime: python3.12
+      Handler: index.ingest_handler
+      Role: !GetAtt ApiRole.Arn
+      Timeout: 10
+      Environment:
+        Variables:
+          STORE_STATUS_TABLE: !Ref StoreStatusTable
+          STORE_EVENTS_TABLE: !Ref StoreEventsTable
+      Code:
+        ZipFile: |
+          import json, os, time
+          import boto3
+
+          ddb = boto3.resource("dynamodb")
+          status_tbl = ddb.Table(os.environ["STORE_STATUS_TABLE"])
+          events_tbl = ddb.Table(os.environ["STORE_EVENTS_TABLE"])
+
+          def _resp(code, body):
+            return {
+              "statusCode": code,
+              "headers": {
+                "Content-Type": "application/json",
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Headers": "*",
+                "Access-Control-Allow-Methods": "OPTIONS,GET,POST",
+              },
+              "body": json.dumps(body, ensure_ascii=False)
+            }
+
+          def ingest_handler(event, context):
+            if event.get("httpMethod") == "OPTIONS":
+              return _resp(200, {"ok": True})
+
+            try:
+              body = json.loads(event.get("body") or "{}")
+              store_id = int(body["store_id"])
+              count = int(body["count"])
+              source = str(body.get("source") or "unknown")
+            except Exception as e:
+              return _resp(400, {"error": f"bad request: {str(e)}"})
+
+            now = int(time.time())
+
+            # 1) append event
+            events_tbl.put_item(Item={
+              "store_id": store_id,
+              "ts": now,
+              "count": count,
+              "source": source,
+            })
+
+            # 2) upsert latest
+            status_tbl.update_item(
+              Key={"store_id": store_id},
+              UpdateExpression="SET current_count=:c, last_seen_at=:t, updated_at=:t",
+              ExpressionAttributeValues={":c": count, ":t": now}
+            )
+
+            return _resp(200, {"ok": True, "store_id": store_id, "count": count, "ts": now})
+
+  QueryFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-query"
+      Runtime: python3.12
+      Handler: index.query_handler
+      Role: !GetAtt ApiRole.Arn
+      Timeout: 10
+      Environment:
+        Variables:
+          STORE_STATUS_TABLE: !Ref StoreStatusTable
+          STORE_EVENTS_TABLE: !Ref StoreEventsTable
+          STALE_SECONDS: !Ref StaleSeconds
+      Code:
+        ZipFile: |
+          import json, os, time, datetime
+          import boto3
+          from boto3.dynamodb.conditions import Key
+
+          ddb = boto3.resource("dynamodb")
+          status_tbl = ddb.Table(os.environ["STORE_STATUS_TABLE"])
+          events_tbl = ddb.Table(os.environ["STORE_EVENTS_TABLE"])
+          STALE = int(os.environ.get("STALE_SECONDS", "120"))
+
+          def _iso(ts):
+            # JST表示にしたい場合（+09:00固定）
+            dt = datetime.datetime.fromtimestamp(ts, tz=datetime.timezone(datetime.timedelta(hours=9)))
+            return dt.isoformat()
+
+          def _resp(code, body):
+            return {
+              "statusCode": code,
+              "headers": {
+                "Content-Type": "application/json",
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Headers": "*",
+                "Access-Control-Allow-Methods": "OPTIONS,GET",
+              },
+              "body": json.dumps(body, ensure_ascii=False)
+            }
+
+          def query_handler(event, context):
+            if event.get("httpMethod") == "OPTIONS":
+              return _resp(200, {"ok": True})
+
+            path = event.get("path") or ""
+            qs = event.get("queryStringParameters") or {}
+
+            # GET /stores/summary
+            if path.endswith("/stores/summary"):
+              now = int(time.time())
+              items = status_tbl.scan().get("Items", [])
+              out = []
+              for x in items:
+                last = int(x.get("last_seen_at", 0))
+                cnt = int(x.get("current_count", 0))
+                stale = (now - last) > STALE
+                if cnt == 0:
+                  status = "zero"
+                elif stale:
+                  status = "stale"
+                else:
+                  status = "ok"
+                out.append({
+                  "store_id": int(x["store_id"]),
+                  "current_count": cnt,
+                  "last_seen_at": _iso(last) if last else None,
+                  "status": status
+                })
+              out.sort(key=lambda r: r["store_id"])
+              return _resp(200, out)
+
+            # GET /stores/{id}/events?limit=200
+            if "/stores/" in path and path.endswith("/events"):
+              try:
+                parts = path.split("/stores/")[1].split("/")
+                store_id = int(parts[0])
+              except:
+                return _resp(400, {"error": "invalid store id"})
+
+              limit = int(qs.get("limit") or 200)
+              res = events_tbl.query(
+                KeyConditionExpression=Key("store_id").eq(store_id),
+                ScanIndexForward=False,
+                Limit=limit
+              )
+              items = res.get("Items", [])
+              out = [{
+                "ts": _iso(int(i["ts"])),
+                "count": int(i["count"]),
+                "source": i.get("source")
+              } for i in items]
+              return _resp(200, {"store_id": store_id, "events": out})
+
+            return _resp(404, {"error": "not found", "path": path})
+
+  RestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub "${ProjectName}-api"
+
+  ApiResourceApi:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !GetAtt RestApi.RootResourceId
+      PathPart: api
+
+  ApiResourceIngest:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref ApiResourceApi
+      PathPart: ingest
+
+  ApiResourceStores:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref ApiResourceApi
+      PathPart: stores
+
+  ApiResourceSummary:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref ApiResourceStores
+      PathPart: summary
+
+  ApiResourceStoreId:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref ApiResourceStores
+      PathPart: "{id}"
+
+  ApiResourceEvents:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref ApiResourceStoreId
+      PathPart: events
+
+  # Methods
+  IngestPost:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref ApiResourceIngest
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${IngestFunction.Arn}/invocations"
+
+  IngestOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref ApiResourceIngest
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${IngestFunction.Arn}/invocations"
+
+  SummaryGet:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref ApiResourceSummary
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${QueryFunction.Arn}/invocations"
+
+  SummaryOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref ApiResourceSummary
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${QueryFunction.Arn}/invocations"
+
+  EventsGet:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref ApiResourceEvents
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${QueryFunction.Arn}/invocations"
+
+  EventsOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref ApiResourceEvents
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${QueryFunction.Arn}/invocations"
+
+  # Lambda permissions for API Gateway
+  PermIngest:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref IngestFunction
+      Principal: apigateway.amazonaws.com
+
+  PermQuery:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref QueryFunction
+      Principal: apigateway.amazonaws.com
+
+  Deployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - IngestPost
+      - SummaryGet
+      - EventsGet
+      - IngestOptions
+      - SummaryOptions
+      - EventsOptions
+    Properties:
+      RestApiId: !Ref RestApi
+      StageName: prod
+
+Outputs:
+  ApiBaseUrl:
+    Value: !Sub "https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/prod/api"
