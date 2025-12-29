@@ -1,13 +1,23 @@
 AWSTemplateFormatVersion: "2010-09-09"
-Description: Store people count backend (API Gateway + Lambda + DynamoDB)
+Description: Store people count backend (API Gateway + Lambda + DynamoDB + LINE notify via Messaging API + LIFF register)
 
 Parameters:
   ProjectName:
     Type: String
     Default: store-people
+
   StaleSeconds:
     Type: Number
     Default: 120
+
+  LineChannelAccessToken:
+    Type: String
+    NoEcho: true
+    Description: "LINE Messaging API channel access token (long-lived)"
+
+  LineLoginChannelId:
+    Type: String
+    Description: "LINE Login channel ID (same provider as LIFF)"
 
 Resources:
   StoreStatusTable:
@@ -38,6 +48,22 @@ Resources:
         - AttributeName: ts
           KeyType: RANGE
 
+  StoreSubscriptionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${ProjectName}-store_subscriptions"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: store_id
+          AttributeType: N
+        - AttributeName: user_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: store_id
+          KeyType: HASH
+        - AttributeName: user_id
+          KeyType: RANGE
+
   ApiRole:
     Type: AWS::IAM::Role
     Properties:
@@ -66,7 +92,11 @@ Resources:
                 Resource:
                   - !GetAtt StoreStatusTable.Arn
                   - !GetAtt StoreEventsTable.Arn
+                  - !GetAtt StoreSubscriptionsTable.Arn
 
+  # -----------------------------
+  # Lambda: ingest (immediate notify for zero / threshold)
+  # -----------------------------
   IngestFunction:
     Type: AWS::Lambda::Function
     Properties:
@@ -74,19 +104,26 @@ Resources:
       Runtime: python3.12
       Handler: index.ingest_handler
       Role: !GetAtt ApiRole.Arn
-      Timeout: 10
+      Timeout: 15
       Environment:
         Variables:
           STORE_STATUS_TABLE: !Ref StoreStatusTable
           STORE_EVENTS_TABLE: !Ref StoreEventsTable
+          SUBS_TABLE: !Ref StoreSubscriptionsTable
+          STALE_SECONDS: !Ref StaleSeconds
+          LINE_CHANNEL_ACCESS_TOKEN: !Ref LineChannelAccessToken
       Code:
         ZipFile: |
-          import json, os, time
+          import json, os, time, urllib.request
           import boto3
+          from boto3.dynamodb.conditions import Key
 
           ddb = boto3.resource("dynamodb")
           status_tbl = ddb.Table(os.environ["STORE_STATUS_TABLE"])
           events_tbl = ddb.Table(os.environ["STORE_EVENTS_TABLE"])
+          subs_tbl = ddb.Table(os.environ["SUBS_TABLE"])
+          STALE = int(os.environ.get("STALE_SECONDS", "120"))
+          LINE_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
 
           def _resp(code, body):
             return {
@@ -99,6 +136,21 @@ Resources:
               },
               "body": json.dumps(body, ensure_ascii=False)
             }
+
+          def _line_push(to_user_id: str, text: str):
+            if not LINE_TOKEN:
+              return
+            url = "https://api.line.me/v2/bot/message/push"
+            payload = json.dumps({
+              "to": to_user_id,
+              "messages": [{"type": "text", "text": text}]
+            }, ensure_ascii=False).encode("utf-8")
+
+            req = urllib.request.Request(url, data=payload, method="POST")
+            req.add_header("Content-Type", "application/json")
+            req.add_header("Authorization", f"Bearer {LINE_TOKEN}")
+            with urllib.request.urlopen(req, timeout=10) as r:
+              r.read()
 
           def ingest_handler(event, context):
             if event.get("httpMethod") == "OPTIONS":
@@ -114,6 +166,15 @@ Resources:
 
             now = int(time.time())
 
+            # get previous status (for edge detection)
+            prev_count = None
+            try:
+              prev = status_tbl.get_item(Key={"store_id": store_id}).get("Item")
+              if prev and "current_count" in prev:
+                prev_count = int(prev["current_count"])
+            except:
+              prev_count = None
+
             # 1) append event
             events_tbl.put_item(Item={
               "store_id": store_id,
@@ -122,15 +183,59 @@ Resources:
               "source": source,
             })
 
-            # 2) upsert latest
+            # 2) upsert latest (+ reset stale_notified_at so stale check can notify again after recovery)
             status_tbl.update_item(
               Key={"store_id": store_id},
-              UpdateExpression="SET current_count=:c, last_seen_at=:t, updated_at=:t",
-              ExpressionAttributeValues={":c": count, ":t": now}
+              UpdateExpression="SET current_count=:c, last_seen_at=:t, updated_at=:t, stale_notified_at=:z",
+              ExpressionAttributeValues={":c": count, ":t": now, ":z": 0}
             )
+
+            # 3) notify (zero / threshold) only when crossing boundary
+            #    - zero: prev != 0 and now == 0
+            #    - threshold: prev > thr and now <= thr
+            if prev_count is not None and prev_count == count:
+              return _resp(200, {"ok": True, "store_id": store_id, "count": count, "ts": now})
+
+            try:
+              res = subs_tbl.query(
+                KeyConditionExpression=Key("store_id").eq(store_id),
+                Limit=1000
+              )
+              subs = res.get("Items", [])
+            except:
+              subs = []
+
+            for s in subs:
+              if not s.get("enabled", True):
+                continue
+              user_id = s.get("user_id")
+              if not user_id:
+                continue
+
+              # zero
+              if s.get("notify_zero", False):
+                if prev_count is not None and prev_count != 0 and count == 0:
+                  _line_push(user_id, f"店舗{store_id}：客数が0人になりました（0人）")
+
+              # threshold
+              thr = s.get("threshold", None)
+              if thr is not None:
+                try:
+                  thr = int(thr)
+                except:
+                  thr = None
+
+              if thr is not None:
+                # user message requirement:
+                # 店舗101：客数がしきい値以下です（2人）
+                if prev_count is not None and prev_count > thr and count <= thr:
+                  _line_push(user_id, f"店舗{store_id}：客数がしきい値以下です（{count}人）")
 
             return _resp(200, {"ok": True, "store_id": store_id, "count": count, "ts": now})
 
+  # -----------------------------
+  # Lambda: query (unchanged API)
+  # -----------------------------
   QueryFunction:
     Type: AWS::Lambda::Function
     Properties:
@@ -156,7 +261,6 @@ Resources:
           STALE = int(os.environ.get("STALE_SECONDS", "120"))
 
           def _iso(ts):
-            # JST表示にしたい場合（+09:00固定）
             dt = datetime.datetime.fromtimestamp(ts, tz=datetime.timezone(datetime.timedelta(hours=9)))
             return dt.isoformat()
 
@@ -179,7 +283,6 @@ Resources:
             path = event.get("path") or ""
             qs = event.get("queryStringParameters") or {}
 
-            # GET /stores/summary
             if path.endswith("/stores/summary"):
               now = int(time.time())
               items = status_tbl.scan().get("Items", [])
@@ -203,7 +306,6 @@ Resources:
               out.sort(key=lambda r: r["store_id"])
               return _resp(200, out)
 
-            # GET /stores/{id}/events?limit=200
             if "/stores/" in path and path.endswith("/events"):
               try:
                 parts = path.split("/stores/")[1].split("/")
@@ -227,6 +329,206 @@ Resources:
 
             return _resp(404, {"error": "not found", "path": path})
 
+  # -----------------------------
+  # Lambda: register (LIFF id_token verify -> save subscription)
+  # -----------------------------
+  RegisterFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-register"
+      Runtime: python3.12
+      Handler: index.register_handler
+      Role: !GetAtt ApiRole.Arn
+      Timeout: 15
+      Environment:
+        Variables:
+          SUBS_TABLE: !Ref StoreSubscriptionsTable
+          LINE_LOGIN_CHANNEL_ID: !Ref LineLoginChannelId
+      Code:
+        ZipFile: |
+          import json, os, time, urllib.request, urllib.parse
+          import boto3
+
+          ddb = boto3.resource("dynamodb")
+          subs_tbl = ddb.Table(os.environ["SUBS_TABLE"])
+          CLIENT_ID = os.environ["LINE_LOGIN_CHANNEL_ID"]
+
+          def _resp(code, body):
+            return {
+              "statusCode": code,
+              "headers": {
+                "Content-Type": "application/json",
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Headers": "*",
+                "Access-Control-Allow-Methods": "OPTIONS,POST",
+              },
+              "body": json.dumps(body, ensure_ascii=False)
+            }
+
+          def _verify_id_token(id_token: str):
+            # POST https://api.line.me/oauth2/v2.1/verify (x-www-form-urlencoded)
+            url = "https://api.line.me/oauth2/v2.1/verify"
+            data = urllib.parse.urlencode({
+              "id_token": id_token,
+              "client_id": CLIENT_ID,
+            }).encode("utf-8")
+            req = urllib.request.Request(url, data=data, method="POST")
+            req.add_header("Content-Type", "application/x-www-form-urlencoded")
+            with urllib.request.urlopen(req, timeout=10) as r:
+              return json.loads(r.read().decode("utf-8"))
+
+          def register_handler(event, context):
+            if event.get("httpMethod") == "OPTIONS":
+              return _resp(200, {"ok": True})
+
+            try:
+              body = json.loads(event.get("body") or "{}")
+              store_id = int(body["store_id"])
+              id_token = str(body["id_token"])
+
+              enabled = bool(body.get("enabled", True))
+              notify_zero = bool(body.get("notify_zero", True))
+              notify_stale = bool(body.get("notify_stale", False))
+              threshold = body.get("threshold", None)
+              if threshold is not None:
+                threshold = int(threshold)
+            except Exception as e:
+              return _resp(400, {"error": f"bad request: {str(e)}"})
+
+            try:
+              v = _verify_id_token(id_token)
+              user_id = v["sub"]  # LINE userId
+            except Exception as e:
+              return _resp(401, {"error": f"id_token verify failed: {str(e)}"})
+
+            now = int(time.time())
+            item = {
+              "store_id": store_id,
+              "user_id": user_id,
+              "enabled": enabled,
+              "notify_zero": notify_zero,
+              "notify_stale": notify_stale,
+              "created_at": now,
+            }
+            if threshold is not None:
+              item["threshold"] = threshold
+
+            subs_tbl.put_item(Item=item)
+            return _resp(200, {"ok": True, "store_id": store_id, "user_id": user_id})
+
+  # -----------------------------
+  # Lambda: stale checker (EventBridge schedule)
+  # -----------------------------
+  StaleCheckFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-stale-check"
+      Runtime: python3.12
+      Handler: index.stale_check_handler
+      Role: !GetAtt ApiRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          STORE_STATUS_TABLE: !Ref StoreStatusTable
+          SUBS_TABLE: !Ref StoreSubscriptionsTable
+          STALE_SECONDS: !Ref StaleSeconds
+          LINE_CHANNEL_ACCESS_TOKEN: !Ref LineChannelAccessToken
+      Code:
+        ZipFile: |
+          import json, os, time, urllib.request
+          import boto3
+          from boto3.dynamodb.conditions import Key
+
+          ddb = boto3.resource("dynamodb")
+          status_tbl = ddb.Table(os.environ["STORE_STATUS_TABLE"])
+          subs_tbl = ddb.Table(os.environ["SUBS_TABLE"])
+          STALE = int(os.environ.get("STALE_SECONDS", "120"))
+          LINE_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
+
+          def _line_push(to_user_id: str, text: str):
+            if not LINE_TOKEN:
+              return
+            url = "https://api.line.me/v2/bot/message/push"
+            payload = json.dumps({
+              "to": to_user_id,
+              "messages": [{"type": "text", "text": text}]
+            }, ensure_ascii=False).encode("utf-8")
+
+            req = urllib.request.Request(url, data=payload, method="POST")
+            req.add_header("Content-Type", "application/json")
+            req.add_header("Authorization", f"Bearer {LINE_TOKEN}")
+            with urllib.request.urlopen(req, timeout=10) as r:
+              r.read()
+
+          def stale_check_handler(event, context):
+            now = int(time.time())
+            items = status_tbl.scan().get("Items", [])
+
+            for x in items:
+              try:
+                store_id = int(x["store_id"])
+                last = int(x.get("last_seen_at", 0))
+                if last == 0:
+                  continue
+                is_stale = (now - last) > STALE
+                if not is_stale:
+                  continue
+
+                stale_notified_at = int(x.get("stale_notified_at", 0))
+                # notify only once per stale episode (ingest resets stale_notified_at to 0)
+                if stale_notified_at and stale_notified_at > 0:
+                  continue
+
+                # get subscribers
+                res = subs_tbl.query(
+                  KeyConditionExpression=Key("store_id").eq(store_id),
+                  Limit=1000
+                )
+                subs = res.get("Items", [])
+
+                for s in subs:
+                  if not s.get("enabled", True):
+                    continue
+                  if not s.get("notify_stale", False):
+                    continue
+                  user_id = s.get("user_id")
+                  if not user_id:
+                    continue
+                  _line_push(user_id, f"店舗{store_id}：送信が{STALE}秒以上止まっています")
+
+                # mark notified
+                status_tbl.update_item(
+                  Key={"store_id": store_id},
+                  UpdateExpression="SET stale_notified_at=:t",
+                  ExpressionAttributeValues={":t": now}
+                )
+              except:
+                continue
+
+            return {"ok": True}
+
+  # EventBridge schedule (every 1 minute)
+  StaleCheckRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${ProjectName}-stale-check-rule"
+      ScheduleExpression: rate(1 minute)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt StaleCheckFunction.Arn
+          Id: StaleCheckTarget
+
+  PermStaleCheckInvoke:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref StaleCheckFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt StaleCheckRule.Arn
+
+  # -----------------------------
+  # API Gateway
+  # -----------------------------
   RestApi:
     Type: AWS::ApiGateway::RestApi
     Properties:
@@ -245,6 +547,13 @@ Resources:
       RestApiId: !Ref RestApi
       ParentId: !Ref ApiResourceApi
       PathPart: ingest
+
+  ApiResourceRegister:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref ApiResourceApi
+      PathPart: register
 
   ApiResourceStores:
     Type: AWS::ApiGateway::Resource
@@ -298,6 +607,30 @@ Resources:
         Type: AWS_PROXY
         IntegrationHttpMethod: POST
         Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${IngestFunction.Arn}/invocations"
+
+  RegisterPost:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref ApiResourceRegister
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${RegisterFunction.Arn}/invocations"
+
+  RegisterOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref ApiResourceRegister
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${RegisterFunction.Arn}/invocations"
 
   SummaryGet:
     Type: AWS::ApiGateway::Method
@@ -362,6 +695,13 @@ Resources:
       FunctionName: !Ref QueryFunction
       Principal: apigateway.amazonaws.com
 
+  PermRegister:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref RegisterFunction
+      Principal: apigateway.amazonaws.com
+
   Deployment:
     Type: AWS::ApiGateway::Deployment
     DependsOn:
@@ -371,6 +711,8 @@ Resources:
       - IngestOptions
       - SummaryOptions
       - EventsOptions
+      - RegisterPost
+      - RegisterOptions
     Properties:
       RestApiId: !Ref RestApi
       StageName: prod
